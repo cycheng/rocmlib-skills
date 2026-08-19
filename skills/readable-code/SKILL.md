@@ -6,7 +6,6 @@ description: Guides implementation toward clear design intent, concise code and 
 
 1. Clearly communicate the design idea and intent. If possible, structure the code so that the implementation naturally reflects the design. The goal is to:
   - Help readers quickly understand the key idea and motivation.
-  - Make it easier for others to suggest a simpler, cleaner, or more elegant design and implementation.
 
 2. Less code is better. Keep the implementation as simple as possible without sacrificing clarity.
 
