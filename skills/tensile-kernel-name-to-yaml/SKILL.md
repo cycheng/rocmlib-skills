@@ -24,13 +24,35 @@ All paths are relative to the repo root. TensileLite lives in
 ## Workflow
 
 ```
-- [ ] 1. Get the exact runtime kernel name and its logic file
-- [ ] 2. Find the logic YAML entry for that name
-- [ ] 3. Convert that one solution to a Tensile input YAML
-- [ ] 4. Repair ProblemType keys the converter drops
+- [ ] 1. Get the exact runtime kernel name (and logic index if available)
+- [ ] 2. Find the logic YAML entry — or hand-build if none exists
+- [ ] 3. Convert (TensileLibLogicToYaml) or write ForkParameters from decode
+- [ ] 4. Repair dropped ProblemType keys
 - [ ] 5. Match the problem size and data init to the failing case
 - [ ] 6. Regenerate and diff the names
 ```
+
+## Python environment
+
+**Always use the tox env — do not install rocisa separately.**
+
+```bash
+cd projects/hipblaslt/tensilelite
+./.tox/py3/bin/python ./Tensile/bin/TensileLibLogicToYaml ...
+./.tox/py3/bin/python -c "import rocisa; print('ok')"
+```
+
+This is the Python the user already has working. Do not run `invoke rocisa`,
+`pip install rocisa`, or bare `python3` unless tox is confirmed missing.
+
+Bare `python3` fails with
+`ImportError: cannot import name 'rocIsa' from 'rocisa' (unknown location)`
+because `tensilelite/rocisa/` has no `__init__.py` and shadows the real package
+when cwd is on `PYTHONPATH`.
+
+If `.tox/py3/` is missing in the agent environment, still emit the repro YAML
+and give verification commands using `./.tox/py3/bin/python` for the user's
+machine.
 
 ### 1. Get the exact name
 
@@ -70,6 +92,19 @@ In the matching file, note the `SolutionIndex` of the entry whose
 one solution (index 0), and its size table may be synthetic — real problem sizes
 fall through to the only solution, so do not expect your size to be listed.
 
+If `TENSILE_DB=0x20000` printed a logic index, grep that file first — it is
+the authoritative source even when a broad content search finds multiple hits.
+
+**When grep finds no logic file** (common for kernels tuned in Tensile tests but
+not yet shipped, e.g. plain `F4SS_BH_UserArgs` without `MXA…`/`MXB…` tokens):
+skip to [Hand-build when no logic file matches](#hand-build-when-no-logic-file-matches).
+GridBased logic may only have `F4SS_MXAE8B32_…` variants; Equality may have a
+nearby type (`F8F8S`, `F4BS`, `BBS`) with the same `MT…_MI…` tail.
+
+**Filename vs runtime prefix:** logic filenames often use `Alik` while runtime
+names use `Ailk` for the same TN layout — compare the parameter tail
+(`MT256x256x256_MI16x16x1_…`), not the index-assignment spelling.
+
 ### 3. Convert one solution to a Tensile input YAML
 
 ```bash
@@ -77,12 +112,6 @@ cd projects/hipblaslt/tensilelite
 ./.tox/py3/bin/python ./Tensile/bin/TensileLibLogicToYaml \
   -i <logic yaml> -d <SolutionIndex> -o /tmp/repro.yaml
 ```
-
-Use a Python that has `rocisa` installed — the tox env at `.tox/py3/` if it
-exists. Running the wrapper with a bare `python3` fails with
-`ImportError: cannot import name 'rocIsa' from 'rocisa' (unknown location)`,
-because `tensilelite/rocisa/` has no `__init__.py` and is picked up as an empty
-namespace package that shadows the real one.
 
 ### 4. Repair dropped ProblemType keys
 
@@ -161,34 +190,54 @@ identical code objects:
 `WorkGroupMappingXCC` (WGMXCC) is **not** in that set — it does affect codegen.
 `diff_kernel_names.py` already classifies these correctly.
 
-## Decoding tokens without a logic file
+## Hand-build when no logic file matches
 
-When no logic file matches, decode the name directly:
+1. Decode every token:
 
 ```bash
 python3 .cursor/skills/tensile-kernel-name-to-yaml/scripts/decode_kernel_name.py '<name>' \
   --tensilelite projects/hipblaslt/tensilelite
 ```
 
-It prints one row per token with the parameter it maps to, flags runtime
-dispatch parameters, and lists any token it could not resolve. Feed the
-non-default values into `ForkParameters` of a hand-written config, using an
-existing test config such as
-`projects/hipblaslt/tensilelite/Tensile/Tests/common/gemm/gfx12/` as the
-skeleton.
+2. Grep logic for a **structural twin** — same arch, same `MT…x…x…_MI…` and
+   schedule tokens (`SIA4`, `TDMI3`, `TLDS1`, `LDSTI1`), even if ProblemType
+   differs (e.g. `F8F8S` reference for an `F4SS` target). Read that solution's
+   full parameter block in the logic YAML for `MatrixInstruction`, `WorkGroup`,
+   and derived fields the decoder does not list.
 
-The naming rule the script implements (`Naming.py`): a token prefix is the
-uppercase letters of the parameter name, and the suffix is the value —
-booleans as `0`/`1`, negatives as `n1`, lists joined by `_`. So `LBSPPA512` is
-`LdsBlockSizePerPadA: 512` and `WGMXCCGn1` is `WorkGroupMappingXCCGroup: -1`.
-An abbreviation can be ambiguous (`AFEM` is both
-`AssertFree0ElementMultiple` and `AssertFree1ElementMultiple`, emitted in that
-order); the script lists all candidates.
+3. Write a single-solution YAML:
+   - **ProblemType** from the name prefix (`F4SS` → `DataType: F4`,
+     `DestDataType: s`, `ComputeDataType: s`, no `MXBlock*` unless `MXA…`/`MXB…`
+     appear in the prefix).
+   - **ForkParameters**: one list entry per decoded non-default parameter.
+     Ignore `[internal arg]` tokens for codegen (still set them if forking a
+     search space).
+   - **MatrixInstruction** 9-tuple from a reference solution:
+     `MIBlock[0:5] + MIWaveTile + MIWaveGroup` (`TensileLibLogicToYaml.py`
+     `form9BitMIInst`). Example: `MI16x16x1` + `MIWT8_8` + `WG32_4_1` →
+     `[16, 16, 128, 1, 1, 8, 8, 2, 2]` and `WorkGroup: [32, 4, 1]`.
+   - **GlobalParameters**: set `Architecture`, `CodeObjectVersion: "4"` for
+     gfx1250; match gtest data init (see step 5).
 
-The leading `Cijk_Ailk_Bljk_HHS_BH_...` prefix is not parameter-encoded — it
-comes from `ProblemType.__str__` in `SolutionStructs/Problem.py`. Read that
-function to decode index assignments, data types, and feature tokens
-(`Bias`, `HA_S`, `SAV`, `UserArgs`).
+4. Skeleton sources:
+   `projects/hipblaslt/tensilelite/Tensile/Tests/common/gemm/gfx12/stinky_sia4.yaml`
+   (SIA4 / TDM / LDSTrInst patterns) or the closest logic-file solution.
+
+5. Verify with `./.tox/py3/bin/python` + `diff_kernel_names.py` after Tensile
+   generates the kernel.
+
+### Token decoding reference
+
+The naming rule (`Naming.py`): token prefix = uppercase letters of the parameter
+name; suffix = value — booleans `0`/`1`, negatives `n1`, lists joined by `_`.
+So `LBSPPA512` → `LdsBlockSizePerPadA: 512`, `WGMXCCGn1` →
+`WorkGroupMappingXCCGroup: -1`. `AFEM` is ambiguous (both
+`AssertFree0ElementMultiple` and `AssertFree1ElementMultiple`; emitted in that
+order).
+
+The leading `Cijk_Ailk_Bljk_HHS_BH_…` prefix is not parameter-encoded — it
+comes from `ProblemType.__str__` in `SolutionStructs/Problem.py` (index
+assignments, data types, `Bias`, `HA_S`, `SAV`, `UserArgs`).
 
 ## Reference paths
 
