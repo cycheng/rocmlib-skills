@@ -19,6 +19,8 @@ into the test directory; no scratch-dir step.
 ## Binary & invocation
 
 - Binary: `/home/cycheng2/tickets/build-opt/tools/stinkytofu-opt/stinkytofu-opt`
+- Docker build binary:
+  `/data1/cycheng2/rocm-libraries/projects/hipblaslt/tensilelite/new_dbg_build_mi450/tensilelite/rocisa/stinkytofu/tools/stinkytofu-opt/stinkytofu-opt`
 - Architecture flag (required for most passes): `--arch gfx1250`
 - Output flag: `--print-output` (emits the post-pass IR in `.stir` format)
 - List available passes: `--list-passes` or `--help`
@@ -33,6 +35,53 @@ Common invocation (used both for ad-hoc inspection and inside the test's
 ```
 
 Multiple passes can be chained; they run in the order given.
+
+### Docker-backed build and test loop
+
+If host-side CMake/ROCm tools are missing or stale, use the MI450 container and
+the existing hipBLASLt build directory:
+
+```bash
+docker exec -w /data1/cycheng2/rocm-libraries/projects/hipblaslt \
+    cy_mi450 bash -lc \
+    'cmake --build tensilelite/new_dbg_build_mi450 --target stinkytofu-opt -j 16'
+
+docker exec -w /data1/cycheng2/rocm-libraries/projects/hipblaslt \
+    cy_mi450 bash -lc \
+    'cmake --build tensilelite/new_dbg_build_mi450 --target stinkytofu-check -j 16'
+```
+
+Run FileCheck tests from the StinkyTofu sub-build, not the top-level build
+directory. The top-level `ctest` may report `Total Tests: 0`.
+
+```bash
+docker exec \
+    -w /data1/cycheng2/rocm-libraries/projects/hipblaslt/tensilelite/new_dbg_build_mi450/tensilelite/rocisa/stinkytofu \
+    cy_mi450 bash -lc \
+    "ctest -R 'FileCheck\.<name>' --output-on-failure"
+```
+
+For multiple tests:
+
+```bash
+docker exec \
+    -w /data1/cycheng2/rocm-libraries/projects/hipblaslt/tensilelite/new_dbg_build_mi450/tensilelite/rocisa/stinkytofu \
+    cy_mi450 bash -lc \
+    "ctest -R 'FileCheck\.(test_a|test_b)' --output-on-failure"
+```
+
+Use non-interactive `docker exec ... bash -lc '...'` in agent/tool calls. The
+user-facing interactive form (`docker exec -w ... -it cy_mi450 bash`) is useful
+for manual debugging, but `-it` is usually unnecessary for automated commands.
+
+### TensileLite GFX1250 integration-test setup
+
+The standalone `stinkytofu-opt` FileCheck workflow does not need the
+TensileLite codegen patch. If the pass test is followed by GFX1250
+TensileLite codegen, assembly-diff, or correctness testing from
+`~/st-codegen-test`, apply
+`~/st-codegen-test/st-patch/run-codegen-only-gfx1250.diff` to the
+`rocm-libraries` checkout before running those integration tests.
 
 ### Pass arguments
 
@@ -141,6 +190,11 @@ Common gotcha: `CHECK: ^merge` matches the predecessor's
 `Successors: ^merge` line first. Anchor with the colon
 (`CHECK: ^merge:`) so it only matches the block header.
 
+When checking debug output rather than only `--print-output` IR, the nearest
+stable anchor may be a pass banner, e.g.
+`CHECK-LABEL: function "same_vmem_group_needs_xcnt"` from
+`AccumulateInstructionSizePass`, rather than `CHECK-LABEL: @func_name`.
+
 ## Workflow
 
 1. Read the user's CFG/instruction description and the pass behavior
@@ -162,15 +216,28 @@ Common gotcha: `CHECK: ^merge` matches the predecessor's
    lines, and pseudo regs printed as `LDS<token>`).
 5. Refresh CMake (FileCheck tests are auto-globbed in
    `shared/stinkytofu/tests/CMakeLists.txt` — no CMake edits needed,
-   but cmake must re-run to register new files):
+   but cmake must re-run to register new files). Host build:
    ```bash
    cd /home/cycheng2/tickets/build-opt && cmake .
+   ```
+   Docker build:
+   ```bash
+   docker exec -w /data1/cycheng2/rocm-libraries/projects/hipblaslt \
+       cy_mi450 bash -lc \
+       'cmake --build tensilelite/new_dbg_build_mi450 --target stinkytofu-check -j 16'
    ```
    Expect `Registered N FileCheck tests` to increase by one.
 6. Run the test:
    ```bash
    cd /home/cycheng2/tickets/build-opt && \
        ctest -R 'FileCheck\.<name>' --output-on-failure
+   ```
+   Docker:
+   ```bash
+   docker exec \
+       -w /data1/cycheng2/rocm-libraries/projects/hipblaslt/tensilelite/new_dbg_build_mi450/tensilelite/rocisa/stinkytofu \
+       cy_mi450 bash -lc \
+       "ctest -R 'FileCheck\.<name>' --output-on-failure"
    ```
    The test name is the file stem (no `.stir`). On failure, ctest prints
    `expected: ...` / `got: ...` showing the actual output line — adjust
